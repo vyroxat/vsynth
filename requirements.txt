@@ -1,9 +1,5 @@
 dearpygui>=1.11.0
-transformers
-torch
-peft
-librosa
-sentencepiece
+faster-whisper
 sounddevice
 numpy
 nltk
