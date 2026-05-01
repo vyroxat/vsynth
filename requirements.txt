@@ -1,0 +1,6 @@
+dearpygui>=1.11.0
+openai-whisper
+sounddevice
+numpy
+nltk
+scipy
