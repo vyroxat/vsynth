@@ -1,5 +1,9 @@
 dearpygui>=1.11.0
-openai-whisper
+transformers
+torch
+peft
+librosa
+sentencepiece
 sounddevice
 numpy
 nltk

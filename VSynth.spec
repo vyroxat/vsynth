@@ -2,7 +2,8 @@
 from PyInstaller.utils.hooks import collect_data_files
 
 datas = []
-datas += collect_data_files('whisper')
+datas += collect_data_files('transformers')
+datas += collect_data_files('librosa')
 
 
 a = Analysis(

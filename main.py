@@ -16,6 +16,13 @@ from collections import deque
 from phonemes import text_to_arpabet
 from synth import render_to_wav
 
+ULTRAVOX_MODEL_ID = "fixie-ai/ultravox-v0_5-llama-3_2-1b"
+ULTRAVOX_SYSTEM_PROMPT = (
+    "You are a speech transcription engine. "
+    "Transcribe spoken English audio accurately and return only the transcript text."
+)
+ULTRAVOX_USER_PROMPT = "Transcribe this audio verbatim in English. Return only the transcript text."
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 SAMPLE_RATE  = 16_000
 CHANNELS     = 1
@@ -25,8 +32,8 @@ WAVEFORM_LEN = 300
 _state = {
     "recording":     False,
     "processing":    False,
-    "whisper_ready": False,
-    "whisper_model": None,
+    "speech_model_ready": False,
+    "speech_model": None,
     "audio_chunks":  [],
     "waveform_buf":  deque([0.0] * WAVEFORM_LEN, maxlen=WAVEFORM_LEN),
     "playback_data": None,
@@ -84,22 +91,46 @@ def _flush_ui_queue():
         elif msg[0] == "set_value":
             dpg.set_value(msg[1], msg[2])
 
-# ── Whisper loader (background) ────────────────────────────────────────────────
-def _load_whisper():
-    _log("Loading Whisper model (base.en)…")
+# ── Ultravox loader (background) ───────────────────────────────────────────────
+def _load_speech_model():
+    _log(f"Loading Ultravox model ({ULTRAVOX_MODEL_ID})...")
     try:
-        import whisper
-        # Use English-only model to prevent hallucinations on music
-        model = whisper.load_model("base.en")
-        _state["whisper_model"] = model
-        _state["whisper_ready"] = True
-        _log("Whisper ready.")
+        import torch
+        import transformers
+
+        use_cuda = torch.cuda.is_available()
+        torch_dtype = torch.float16 if use_cuda else torch.float32
+        device = 0 if use_cuda else -1
+
+        model = transformers.pipeline(
+            model=ULTRAVOX_MODEL_ID,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
+        _state["speech_model"] = model
+        _state["speech_model_ready"] = True
+        _log("Ultravox ready.")
         dpg.configure_item("record_btn", enabled=True)
         dpg.configure_item("load_audio_btn", enabled=True)
-        dpg.set_value("whisper_status", "Whisper: READY")
+        dpg.set_value("speech_status", "Ultravox: READY")
     except Exception as e:
-        _log(f"Whisper load failed: {e}")
-        dpg.set_value("whisper_status", "Whisper: ERROR")
+        _log(f"Ultravox load failed: {e}")
+        dpg.set_value("speech_status", "Ultravox: ERROR")
+
+
+def _transcribe_with_ultravox(audio, sampling_rate: int) -> str:
+    model = _state["speech_model"]
+    text = model(
+        {
+            "audio": audio,
+            "sampling_rate": sampling_rate,
+            "turns": [{"role": "system", "content": ULTRAVOX_SYSTEM_PROMPT}],
+            "prompt": ULTRAVOX_USER_PROMPT,
+        },
+        max_new_tokens=128,
+    )
+    return text.strip().strip('"')
 
 # ── Audio recording ────────────────────────────────────────────────────────────
 def _recording_thread():
@@ -134,15 +165,7 @@ def _process_audio():
     audio = np.concatenate(_state["audio_chunks"]).astype(np.float32)
 
     try:
-        model = _state["whisper_model"]
-        result = model.transcribe(
-            audio, 
-            language="en", 
-            fp16=False,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6
-        )
-        text = result["text"].strip()
+        text = _transcribe_with_ultravox(audio, SAMPLE_RATE)
         _log(f"Transcribed: {text!r}")
         dpg.set_value("transcription_text", text)
         _synthesize(text)
@@ -150,23 +173,16 @@ def _process_audio():
         _log(f"Transcription error: {e}")
         _state["processing"] = False
         dpg.configure_item("record_btn", enabled=True)
-        dpg.configure_item("load_audio_btn", enabled=True)
 
 def _process_audio_file(path: str):
     _state["processing"] = True
     dpg.configure_item("record_btn", enabled=False)
-    dpg.configure_item("load_audio_btn", enabled=False)
     _log(f"Transcribing file: {os.path.basename(path)}…")
     try:
-        model = _state["whisper_model"]
-        result = model.transcribe(
-            path, 
-            language="en", 
-            fp16=False,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6
-        )
-        text = result["text"].strip()
+        import librosa
+
+        audio, sampling_rate = librosa.load(path, sr=SAMPLE_RATE, mono=True)
+        text = _transcribe_with_ultravox(audio, sampling_rate)
         _log(f"Transcribed: {text!r}")
         dpg.set_value("transcription_text", text)
         _synthesize(text)
@@ -174,7 +190,6 @@ def _process_audio_file(path: str):
         _log(f"Transcription error: {e}")
         _state["processing"] = False
         dpg.configure_item("record_btn", enabled=True)
-        dpg.configure_item("load_audio_btn", enabled=True)
 
 def _synthesize(text: str):
     _log("Converting to ARPABET…")
@@ -207,7 +222,6 @@ def _synthesize_arpabet(arpabet: str, play_audio: bool = True):
     finally:
         _state["processing"] = False
         dpg.configure_item("record_btn", enabled=True)
-        dpg.configure_item("load_audio_btn", enabled=True)
 
 def _play_wav(path: str):
     try:
@@ -272,7 +286,7 @@ def _on_save_wav():
         threading.Thread(target=_save_task, daemon=True).start()
 
 def _on_load_audio_click():
-    if _state["processing"]:
+    if _state["processing"] or not _state.get("speech_model_ready"):
         return
     import tkinter as tk
     from tkinter import filedialog
@@ -403,10 +417,10 @@ def _build_ui():
         # ── Header ──────────────────────────────────────────────────────────
         with dpg.group(horizontal=True):
             dpg.add_text("VSYNTH", color=GREEN)
-            dpg.add_text("  |  Voice → Whisper → klattsch formant synth",
+            dpg.add_text("  |  Voice → Ultravox → klattsch formant synth",
                          color=TEXT_DIM)
             dpg.add_spacer(width=20)
-            dpg.add_text("", tag="whisper_status", color=AMBER)
+            dpg.add_text("", tag="speech_status", color=AMBER)
             dpg.add_spacer(width=10)
             dpg.add_text("", tag="rec_indicator", color=RED)
         dpg.add_separator()
@@ -599,9 +613,9 @@ def main():
     dpg.setup_dearpygui()
     dpg.show_viewport()
 
-    # Load Whisper in background
-    dpg.set_value("whisper_status", "Whisper: LOADING…")
-    threading.Thread(target=_load_whisper, daemon=True).start()
+    # Load Ultravox in background
+    dpg.set_value("speech_status", "Ultravox: LOADING...")
+    threading.Thread(target=_load_speech_model, daemon=True).start()
 
     # Main loop with per-frame callback
     while dpg.is_dearpygui_running():
